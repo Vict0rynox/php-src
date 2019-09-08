@@ -941,6 +941,38 @@ static zend_always_inline zend_bool zend_check_type(
 	 * because this case is already checked at compile-time. */
 }
 
+static zend_always_inline zend_bool zend_check_implicit_class_cast(
+        zend_type type,
+        zval *arg, zend_class_entry **ce, void **cache_slot,
+        zval *default_value, zend_class_entry *scope,
+        zend_bool is_return_type)
+{
+    //for first step check curr arg type is closure
+
+    ZVAL_DEREF(arg);
+    if (ZEND_TYPE_IS_CLASS(type)) {
+        if (EXPECTED(*cache_slot)) {
+            *ce = (zend_class_entry *) *cache_slot;
+        } else {
+            *ce = zend_fetch_class(ZEND_TYPE_NAME(type), (ZEND_FETCH_CLASS_AUTO | ZEND_FETCH_CLASS_NO_AUTOLOAD));
+            if (UNEXPECTED(!*ce)) {
+                return Z_TYPE_P(arg) == IS_NULL && (ZEND_TYPE_ALLOW_NULL(type) || (default_value && is_null_constant(scope, default_value)));
+            }
+            *cache_slot = (void *) *ce;
+        }
+        if (EXPECTED(Z_TYPE_P(arg) == IS_OBJECT)) {
+            //return instanceof_function(Z_OBJCE_P(arg), *ce);
+            //check if arg is clousre
+            const zend_class_entry *instance_ce = Z_OBJCE_P(arg);
+            if(zend_binary_strcmp((char *)instance_ce->name->val, instance_ce->name->len, "Closure", sizeof("Closure") - 1) == 0) {
+                //check if agrument type is interfaces and he has only one method;
+                return (*ce)->ce_flags & ZEND_ACC_INTERFACE && (*ce)->function_table.nNumOfElements == 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static zend_always_inline int zend_verify_arg_type(zend_function *zf, uint32_t arg_num, zval *arg, zval *default_value, void **cache_slot)
 {
 	zend_arg_info *cur_arg_info;
@@ -955,13 +987,71 @@ static zend_always_inline int zend_verify_arg_type(zend_function *zf, uint32_t a
 	}
 
 	ce = NULL;
-	if (UNEXPECTED(!zend_check_type(cur_arg_info->type, arg, &ce, cache_slot, default_value, zf->common.scope, 0))) {
+    //Check if arg type is closure and expected type is interface with one method
+    if (UNEXPECTED(!zend_check_type(cur_arg_info->type, arg, &ce, cache_slot, default_value, zf->common.scope, 0))) {
+        if(EXPECTED(zend_check_implicit_class_cast(cur_arg_info->type, arg, &ce, cache_slot, default_value, zf->common.scope, 0))) {
+            //create anon class
+            //Bind closure to call interface method
+            //class@anonymous
+
+            const zend_function *clfun = zend_get_closure_method_def(arg);
+            zend_class_entry *instance_ce = Z_OBJCE_P(arg);
+
+            zend_string *fname;
+            zend_hash_get_current_key(&ce->function_table, &fname, 0);
+            //zend_hash_add_new_ptr(&instance_ce->function_table, zend_string_copy(fname), clfun);
+
+            zend_string *name, *lcname;
+            zend_class_entry *ace = zend_arena_alloc(&CG(arena), sizeof(zend_class_entry));
+            name = zend_string_init("class@anonymous", sizeof("class@anonymous") - 1, 1);
+            lcname = zend_string_tolower(name);
+            ace->type = ZEND_USER_CLASS;
+            ace->name = name;
+            zend_initialize_class_data(ace, 1);
+            /* Serialization is not supported for anonymous classes */
+            ace->serialize = zend_class_serialize_deny;
+            ace->unserialize = zend_class_unserialize_deny;
+            zend_class_implements(ace, 1, ce);
+            zend_hash_add_new_ptr(&ace->function_table, fname/*zend_string_copy()*/, clfun);
+
+            if (!zend_hash_exists(CG(class_table), lcname)) {
+                zend_hash_add_ptr(CG(class_table), lcname, ace);
+            } else {
+                 /*This anonymous class has been included, reuse the existing definition.
+                 * NB: This behavior is buggy, and this should always result in a separate
+                 * class declaration. However, until the problem of RTD key collisions is
+                 * solved, this gives a behavior close to what is expected.*/
+                zval zv;
+                ZVAL_PTR(&zv, ace);
+                destroy_zend_class(&zv);
+                ace = zend_hash_find_ptr(CG(class_table), lcname);
+            }
+
+            zend_object *cobj = Z_OBJ_P(arg);
+            cobj->ce = ace;
+
+
+            //zend_class_entry ace;
+            //INIT_CLASS_ENTRY(ace, "class@anonymous", NULL);
+            //zend_class_entry *anon_class_entry = zend_register_internal_class(&ace);
+            //zend_class_implements(anon_class_entry, 1, ce);
+            //zend_hash_add_new_ptr(&anon_class_entry->function_table, zend_string_copy(fname), clfun);
+
+
+
+
+            //arg->value.obj->handlers->get_method
+
+            return 1;
+        }
 		zend_verify_arg_error(zf, cur_arg_info, arg_num, ce, arg);
 		return 0;
 	}
 
 	return 1;
 }
+
+
 
 static zend_never_inline int zend_verify_internal_arg_types(zend_function *fbc, zend_execute_data *call)
 {
